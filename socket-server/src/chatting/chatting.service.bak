@@ -1,0 +1,313 @@
+import { InjectRedis } from '@liaoliaots/nestjs-redis';
+import { Member, SessionInfo } from '@lib/entity';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Redis } from 'ioredis';
+import { Server, Socket } from 'socket.io';
+import { DataSource, Repository } from 'typeorm';
+import * as jwt from 'jsonwebtoken';
+import { uuid } from 'uuidv4';
+import { TokenCheckService } from 'src/manager/auth/tocket-check.service';
+import { promisify } from 'util';
+
+@Injectable()
+export class ChattingService {
+  private static readonly logger = new Logger(ChattingService.name);
+  constructor(
+    @InjectRedis() private readonly redisClient: Redis,
+    @InjectRepository(SessionInfo)
+    private sessionRepository: Repository<SessionInfo>,
+    @Inject(DataSource) private dataSource: DataSource,
+    private readonly tokenCheckService: TokenCheckService,
+  ) {}
+
+  async setJson(key: string, value: any): Promise<void> {
+    const jsonValue = JSON.stringify(value);
+    await this.redisClient.set(key, jsonValue);
+  }
+
+  async getJson(key: string): Promise<any> {
+    const jsonValue = await this.redisClient.get(key);
+    return JSON.parse(jsonValue);
+  }
+
+  async updateJson(
+    key: string,
+    fieldName: string,
+    fieldValue: any,
+  ): Promise<void> {
+    const jsonValue = await this.redisClient.get(key);
+    const objValue = JSON.parse(jsonValue);
+
+    objValue[fieldName] = fieldValue;
+
+    const newJsonValue = JSON.stringify(objValue);
+    await this.redisClient.set(key, newJsonValue);
+  }
+
+  // 소켓 연결
+  async handleConnection(client: Socket) {
+    const memberInfo = await this.tokenCheckService.checkLoginToken(
+      client.handshake.auth.jwtAccessToken,
+    );
+
+    // 해당 멤버가 존재하지 않을 경우 연결 종료
+    if (!memberInfo) {
+      client.disconnect();
+      return;
+    }
+
+    client.join(memberInfo.memberInfo.memberId);
+    client['data'].memberId = memberInfo.memberInfo.memberId;
+    console.log(
+      `채팅 서버에 연결되었어요 ✅ \n${memberInfo.memberInfo.memberId}`,
+    );
+  }
+
+  // 메세지 받기
+  async sendMessage(client: Socket, message: string) {
+    ChattingService.logger.debug('받은 메세지 : ' + message);
+    console.log(client.handshake.auth.jwtAccessToken);
+
+    const memberInfo = await this.tokenCheckService.checkLoginToken(
+      client.handshake.auth.jwtAccessToken,
+    );
+
+    const socketInfo = await this.redisClient.get(
+      `socket:${memberInfo.memberInfo.memberId}`,
+    );
+
+    if (!memberInfo) {
+      client.disconnect();
+      return;
+    }
+
+    //memberinfo 에서 닉네임 가져오기
+    console.log('채팅에서 호출한 닉네임');
+    console.log(memberInfo.memberInfo.nickname);
+
+    // 메세지 요청한 클라이언트에게 메세지 전송
+    client.emit(
+      'C_SendMessage',
+      memberInfo.memberInfo.nickname + ':' + message,
+    );
+
+    //현재 접속중인 방 모든 유저에게 메세지 전송
+
+    client
+      .to(client.data.roomId)
+      .emit('C_SendMessage', memberInfo.memberInfo.nickname + ':' + message);
+  }
+
+  // 귓속말 특정 소켓에만 메세지 전송
+  async sendDirectMessage(
+    client: Socket,
+    targetMemberId: any,
+    message: string,
+  ) {
+    // if (!targetSocket || targetSocket === undefined) {
+    //   return client.emit('GetMessage', '알림 : 귓속말 대상이 존재하지 않습니다.');
+    // }
+
+    // if (!targetSocket.connected) {
+    //   return client.emit('GetMessage', '알림 : 귓속말 대상이 현재 오프라인 상태 입니다.');
+    // }
+
+    const targetSocket = await this.redisClient.get(`socket:${targetMemberId}`);
+
+    ChattingService.logger.debug('payload' + { message });
+    ChattingService.logger.debug(
+      '받는 사람 : ' + JSON.parse(targetSocket).nickname,
+    );
+    ChattingService.logger.debug('받은 메세지 : ' + { message });
+
+    //현재 클라이언트에게 메세지 전송
+    client.emit(
+      'C_SendMessage',
+      `[DM]${JSON.parse(targetSocket).nickname}에게 보낸 메세지:${message}`,
+    );
+
+    // 특정 방에 접속해있는 특정 소켓에게만 메세지 전송
+    client
+      .to(targetMemberId)
+      .emit(
+        'C_SendMessage',
+        `[DM]${JSON.parse(targetSocket).nickname}이 보낸 메세지 :${message}`,
+      );
+  }
+
+  // 채팅 방 생성
+  async createChatRoom(client: Socket, roomName: string) {
+    const roomId = `room:${uuid()}`;
+    ChattingService.logger.debug(roomId);
+    const memberInfo = await this.tokenCheckService.checkLoginToken(
+      client.handshake.auth.jwtAccessToken,
+    );
+    const nickname: string = memberInfo.memberInfo.nickname;
+    client.emit(
+      'C_SendMessage',
+      '"' + nickname + '"님이 "' + roomName + '"방을 생성하였습니다.',
+    );
+
+    this.redisClient.set(
+      roomId,
+      JSON.stringify({
+        roomId: roomId,
+        cheifId: memberInfo.memberInfo.memberId,
+        roomName: roomName,
+      }),
+    );
+
+    client.data.roomId = roomId;
+    client.rooms.clear();
+    client.join(roomId);
+  }
+
+  // 채팅 방 입장
+  async enterChatRoom(server: Server, client: Socket, roomId: string) {
+    const getAsync = promisify(this.redisClient.get).bind(this.redisClient);
+    const setAsync = promisify(this.redisClient.set).bind(this.redisClient);
+    const hmsetAsync = promisify(this.redisClient.hmset).bind(this.redisClient);
+
+    const hgetallAsync = promisify(this.redisClient.hgetall).bind(
+      this.redisClient,
+    );
+    const smembersAsync = promisify(this.redisClient.smembers).bind(
+      this.redisClient,
+    );
+    const saddAsync = promisify(this.redisClient.sadd).bind(this.redisClient);
+
+    const { nickname } = client.data;
+    const redisRoomId = `room:${roomId}`;
+
+    // 병렬 처리
+    const [checkRoom, memberInfo] = await Promise.all([
+      getAsync(`room:${roomId}`),
+      this.tokenCheckService.checkLoginToken(
+        client.handshake.auth.jwtAccessToken,
+      ),
+    ]);
+
+    // 캐시에 존재하는 방 정보 사용
+    if (checkRoom) {
+      const roomInfoList = JSON.parse(checkRoom);
+      const memberSetKey = `room:${roomId}:playerlist`;
+
+      //redis set에 멤버 아이디가 있는지 확인
+
+      if (
+        !(await smembersAsync(memberSetKey)).includes(
+          memberInfo.memberInfo.memberId,
+        )
+      ) {
+        await saddAsync(memberSetKey, memberInfo.memberInfo.memberId);
+        // roomInfoList.memberList.push({
+        //   memberId: memberInfo.memberInfo.memberId,
+        //   nickname: memberInfo.memberInfo.nickname,
+        // });
+        const roomInfo = await getAsync(`room:${roomId}`);
+        if (!roomInfo) {
+          await hmsetAsync(
+            `room:${roomId}`,
+            'memberList',
+            JSON.stringify(roomInfoList.memberList),
+          );
+        }
+        client.data.roomId = redisRoomId;
+        client.rooms.clear();
+        client.join(redisRoomId);
+        console.log('############# 위에 쪼인');
+        return server
+          .to(redisRoomId)
+          .emit('C_SendMessage', `"${nickname}"님이 접속하셨습니다.`);
+      } else {
+        // 이미 접속한 경우 방에 입장하지 않음
+        console.log('이미 접속해 있엉');
+        return;
+      }
+    }
+
+    // 캐시에 방 정보가 없는 경우 새로운 방 생성
+    const roomInfoList = {
+      roomId: roomId,
+      cheifId: memberInfo.memberInfo.memberId,
+    };
+
+    await Promise.all([
+      setAsync(`room:${roomId}`, JSON.stringify(roomInfoList)),
+      saddAsync(`room:${roomId}:playerlist`, memberInfo.memberInfo.memberId),
+    ]);
+
+    this.updateJson(
+      `socket:${memberInfo.memberInfo.memberId}`,
+      'roomId',
+      redisRoomId,
+    );
+
+    console.log('############# 밑에 쪼인');
+
+    client.data.roomId = redisRoomId;
+    client.rooms.clear();
+    client.join(redisRoomId);
+    return server
+      .to(roomId)
+      .emit('C_SendMessage', `"${nickname}"님이 접속하셨습니다.`);
+  }
+
+  // 채팅 방 나가기
+  async exitChatRoom(server: Server, client: Socket, roomId: string) {
+    client.data.roomId = `room:lobby`;
+    client.rooms.clear();
+    client.join(`room:lobby`);
+    const { nickname } = client.data;
+    server
+      .to(roomId)
+      .emit('C_SendMessage', '"' + nickname + '"님이 방에서 나갔습니다.');
+  }
+
+  // 방 가져오기
+  async getChatRoom(client: Socket, roomId: string) {
+    if (
+      !this.redisClient.get(roomId) ||
+      this.redisClient.get(roomId) === undefined
+    ) {
+      return client.emit('C_SendMessage', '알림 : 존재하지 않는 방입니다.');
+    }
+
+    const room = await this.redisClient.get(roomId);
+
+    return JSON.parse(room).roomName;
+  }
+
+  // 접속중인 사용자 닉네임 리스트 가져오기
+  async getPlayerList(client: Socket) {
+    const playerList = await this.redisClient.keys('socket:*');
+    const playerNickNameList = [];
+
+    // playerList 순차적으로 조회하면서 닉네임만 추출
+    for (let i = 0; i < playerList.length; i++) {
+      const player = await this.redisClient.get(playerList[i]);
+      playerNickNameList.push(JSON.parse(player).nickname);
+    }
+
+    client.emit('GetConnectedClientList', JSON.stringify(playerNickNameList));
+  }
+
+  // 방 리스트 가져오기
+  async getChatRoomList() {
+    const roomList = await this.redisClient.keys('room:*');
+    const roomListData = [];
+    for (let i = 0; i < roomList.length; i++) {
+      const room = await this.redisClient.get(roomList[i]);
+      roomListData.push(JSON.parse(room));
+    }
+
+    return roomListData;
+  }
+
+  // 방 삭제
+  async deleteChatRoom(server: Server, roomId: string) {
+    await this.redisClient.del(roomId); // redis에서 방 삭제
+    server.sockets.adapter.rooms.delete(roomId);
+  }
+}

@@ -1,0 +1,21 @@
+config:
+  socketio:
+    auth:
+      jwtAccessToken: 'jd6i27bEP2Z9Zy8EvUaRGpmSorWln0B0IDw6gYi5YwhCS2kR/ikVxpPlnKNAf50Wk55mQUPrRkZXDEy6/EdjAEbTvPVLAyKswvq9wt2k38W4Z3lOMH/iYkZKYfWoac5vqGaW6Zslv5zM9ovVzl6eA0Hhn78LozaeF8kFdZWniUBWEJm6SzB0SMApmMumBaxvRHPBo2wHbEmnd40kRI6ixY6I4VfUaLM/pn4b1bWXaAMVYHotAv7teGzCI4ONpZFU'
+      sessionId: 'Io90u80gPmY/m4ggDlbTXF2dJid5r3zhYikVpx/9emEOts/9Gk/mUzwM43jpHu0W'
+    transports: ['websocket']
+  target: 'http://127.0.0.1:3910'
+  phases:
+    - duration: 365
+      arrivalRate: 20
+
+scenarios:
+  - engine: 'socketio'
+    flow:
+      - loop:
+          - emit:
+              namespace: '/chatting'
+              channel: 'S_SendMessage'
+              message: 'message~~'
+          - think: 10
+        count: 1
